@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+import argparse
+import glob
+import os
+import signal
+import sys
+import time
+
+VID, PID = 0xAA88, 0x8666
+
+
+def find_hidraw():
+    for dev in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(os.path.join(dev, "device", "uevent")) as f:
+                ue = f.read()
+        except OSError:
+            continue
+        if f"HID_ID=0003:{VID:08X}:{PID:08X}" in ue.upper():
+            return "/dev/" + os.path.basename(dev)
+    return None
+
+
+def cpu_temp():
+    for d in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            name = open(os.path.join(d, "name")).read().strip()
+        except OSError:
+            continue
+        if name not in ("k10temp", "zenpower", "coretemp"):
+            continue
+        inputs = sorted(glob.glob(os.path.join(d, "temp*_input")))
+        for lbl in ("Tctl", "Tdie", "Package id 0"):
+            for i in inputs:
+                try:
+                    if open(i.replace("_input", "_label")).read().strip() == lbl:
+                        return int(open(i).read()) // 1000
+                except (OSError, ValueError):
+                    pass
+        if inputs:
+            try:
+                return int(open(inputs[0]).read()) // 1000
+            except (OSError, ValueError):
+                pass
+    return 0
+
+
+# mesmo formato do programa oficial: [0, cpu °C, gpu, cpu %, ram %, placa, gpu %, 0, 0, 0, 0]
+# o G1 só mostra a temperatura da CPU, então o resto vai zerado
+def build_packet(t):
+    return bytes([0, max(0, min(255, t))] + [0] * 9)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Display do water cooler MANCER G1")
+    ap.add_argument("--interval", type=float, default=1.0, help="segundos entre atualizações")
+    ap.add_argument("--device", help="caminho do hidraw (detecta sozinho se não informar)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="mostra os pacotes enviados")
+    ap.add_argument("--once", action="store_true", help="envia uma vez e sai")
+    args = ap.parse_args()
+
+    running = True
+
+    def stop(*_):
+        nonlocal running
+        running = False
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    fd = None
+    while running:
+        if fd is None:
+            path = args.device or find_hidraw()
+            if not path:
+                if args.verbose:
+                    print("display não encontrado, tentando de novo...", file=sys.stderr)
+                time.sleep(2)
+                continue
+            try:
+                fd = os.open(path, os.O_WRONLY)
+                print(f"conectado: {path}", file=sys.stderr)
+            except OSError as e:
+                print(f"não consegui abrir {path}: {e}", file=sys.stderr)
+                time.sleep(2)
+                continue
+
+        pkt = build_packet(cpu_temp())
+        try:
+            os.write(fd, pkt)
+            if args.verbose:
+                print("enviado", pkt.hex(" "), file=sys.stderr)
+        except OSError as e:
+            print(f"falha ao enviar ({e}), reconectando", file=sys.stderr)
+            os.close(fd)
+            fd = None
+        if args.once:
+            break
+        time.sleep(args.interval)
+
+    if fd is not None:
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    main()
